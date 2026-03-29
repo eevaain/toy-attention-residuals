@@ -49,12 +49,64 @@ x_batch, y_batch = next(iter(dataloader)) # forces dataloader to give us the fir
 # print(y_batch[0, :, 0])
 
 
+class SelfAttention(nn.Module): # for a single head of attention. 
+    def __init__(self, D, headDim):
+        super().__init__()
+
+        self.headDim = headDim
+
+        # split weight matrices by columns (thats why we use headDim), we give each head same X matrix 
+        self.wq = nn.Linear(D, headDim, bias=False) ## nn.linear typically used for when u want to learn new transformations (stateful) ... we wouldnt use einsum here cus einsum is stateless
+        self.wk = nn.Linear(D, headDim, bias=False)
+        self.wv = nn.Linear(D, headDim, bias=False)
+
+    def forward(self, x):
+        Q = self.wq(x) # does matmul of [B, T, D] @ [D, headDim] = [B, T, headDim]
+        K = self.wk(x) # also [B, T, headDim]
+        V = self.wv(x) # also [B, T, headDim]
+
+        logits = torch.einsum("b t d, b s d -> b t s", Q, K) / (self.headDim ** 0.5)
+        # ^^ bst is just K but transposed btw. 
+        # s is just a dummy varaible for t (s=t) because einsum needs unique labels for each dimension. 
+        #  then do [B, T, D] @ [B, D, T=S] -> [B, T, T=S] (batch of attention score matrices)
+
+        # ^^ since we know we want to preserve batch and NOT mix across batches we can rethink this as:
+        # [t, s] @ [s, t] -> [t,t] (we can see the contraction more clearly here, because we sum along the s dimension
+
+        atten_weights = F.softmax(logits, dim=-1) 
+        out = torch.einsum("b t s, b s d -> b t d", atten_weights, V)
+        return out
+    
+
+class MHA(nn.Module): 
+    def __init__(self, D, num_heads=4):
+        super().__init__()
+
+        self.heads = nn.ModuleList([SelfAttention(D) for _ in range(num_heads)])
+        self.final_proj = nn.Linear(D * num_heads, D) # utlimately we want D*D at the end. we keep this in the init cus its stateful! 
+
+    def forward(self, x, D): 
+        concatenated_heads = []
+
+        for head in self.heads:
+            head_out = head(x, D) # [B,T D]
+            concatenated_heads.append(head_out)
+        
+        return self.final_proj(concatenated_heads)
+
+
+
+
+
+# oh i should save my loss runs and gradients before i lose them? make a folder? 
 
 class FullAtnnResLayer(nn.Module):
     def __init__(self, D): # init is always "build time" 
         super().__init__()
 
         self.query = nn.Parameter(torch.zeros(D)) # this 1d vector lives inside a layer permanently. (just a weight vector)
+        ## fun fact ^^ nn.Parameter tells pytorch's memory allocator to allocate physical memory for this tensor PERMANENTLY, and let the autograd engine know that it exists
+        ## ^^ if u look at definiton for nn.Linear vs torch.einsum, you'll see that torch.einsum has no nn.parameter! 
         self.norm = nn.RMSNorm(D)
 
         self.transform = nn.Sequential(
@@ -86,7 +138,7 @@ class FullAtnnResLayer(nn.Module):
         return out 
 
 
-class AttentionRoutingModel(nn.Module):
+class AttentionRoutingModel(nn.Module): # our actual model 
     ## btw we inherit __call__ from nn.Module. python lets u treat objects of that class as if they were functions 
     def __init__(self, D, num_layers=4, use_attn_res=True):
         super().__init__()
@@ -129,7 +181,7 @@ if __name__ == "__main__":
     # probe gradients in layer 1 since we have to propagate from last layer back to first. perhaps attnres will help gradients flow back to layer 1 better than standard res? 
     layer1_grads = []
     def capture_gradients(grad):
-        layer1_grads.append(grad.abs().mean().item()) # snapshot of a batch 
+        layer1_grads.append(grad.abs().mean().item()) # snapshot of a weight gradient i.e. if a weight matrix is (D x D*2), like in our first linear layer, then the gradient is 16x32 = 512 values. 
     
     model.layers[0].transform[0].weight.register_hook(capture_gradients) # this is a hook that triggers capture_gradients every time a gradient flows through the weight matrix of the first linear layer. 
 
@@ -151,7 +203,7 @@ if __name__ == "__main__":
             epoch_loss += loss.item()
 
         # calcualte avg gradient magnitude for layer 1
-        avg_grad = sum(layer1_grads[-len(dataloader):]) / len(dataloader)
+        avg_grad = sum(layer1_grads[-len(dataloader):]) / len(dataloader) # grab the last 157 entries within layer1_grads, sum them up and divide by 157! 
         print(f"Epoch {epoch+1}/{epochs} | Loss: {epoch_loss/len(dataloader):.4f} | Avg Layer-1 Gradient: {avg_grad:.6f}")
 
 # TODO: implement block attnres 
