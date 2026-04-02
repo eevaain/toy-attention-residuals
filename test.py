@@ -55,10 +55,12 @@ class SelfAttention(nn.Module): # for a single head of attention.
 
         self.headDim = headDim
 
-        # split weight matrices by columns (thats why we use headDim), we give each head same X matrix 
+        # split weight matrices by columns (thats why we use headDim), we give each head same X matrix, with weights [D, headDim]
         self.wq = nn.Linear(D, headDim, bias=False) ## nn.linear typically used for when u want to learn new transformations (stateful) ... we wouldnt use einsum here cus einsum is stateless
         self.wk = nn.Linear(D, headDim, bias=False)
         self.wv = nn.Linear(D, headDim, bias=False)
+
+        # TODO: add a KV cache?
 
     def forward(self, x):
         Q = self.wq(x) # does matmul of [B, T, D] @ [D, headDim] = [B, T, headDim]
@@ -66,7 +68,6 @@ class SelfAttention(nn.Module): # for a single head of attention.
         V = self.wv(x) # also [B, T, headDim]
 
         logits = torch.einsum("b t d, b s d -> b t s", Q, K) / (self.headDim ** 0.5)
-        # ^^ bst is just K but transposed btw. 
         # s is just a dummy varaible for t (s=t) because einsum needs unique labels for each dimension. 
         #  then do [B, T, D] @ [B, D, T=S] -> [B, T, T=S] (batch of attention score matrices)
 
@@ -75,47 +76,59 @@ class SelfAttention(nn.Module): # for a single head of attention.
 
         atten_weights = F.softmax(logits, dim=-1) 
         out = torch.einsum("b t s, b s d -> b t d", atten_weights, V)
-        return out
+        return out # [B,T, headDim]
     
 
 class MHA(nn.Module): 
     def __init__(self, D, num_heads=4):
         super().__init__()
 
-        self.heads = nn.ModuleList([SelfAttention(D) for _ in range(num_heads)])
-        self.final_proj = nn.Linear(D * num_heads, D) # utlimately we want D*D at the end. we keep this in the init cus its stateful! 
+        self.num_heads = num_heads
+        self.head_dim = D // num_heads
+        self.D = D
 
-    def forward(self, x, D): 
-        concatenated_heads = []
+        self.heads = nn.ModuleList([SelfAttention(self.D, self.head_dim) for _ in range(self.num_heads)])
+        self.final_proj = nn.Linear(self.D, self.D) # utlimately we want D*D at the end. we keep this in the init cus its stateful! 
+
+    def forward(self, x): 
+        head_outputs = [] # [B T D] (after we concat all the head outputs together) 
 
         for head in self.heads:
-            head_out = head(x, D) # [B,T D]
-            concatenated_heads.append(head_out)
-        
-        return self.final_proj(concatenated_heads)
+            head_out = head(x) # [B,T headDim]
+            head_outputs.append(head_out) 
 
-
-
-
+        concatenated_heads = torch.cat(head_outputs, dim=-1) # concat along D of [B, T, headDim] to recover [B,T,D]
+        # ^^ fun fact: good practice to do torch.cat outsde of loop because its a costly operation
+        return self.final_proj(concatenated_heads) # does [B,T,D] @ [D,D]-> [B,T,D]
 
 # oh i should save my loss runs and gradients before i lose them? make a folder? 
 
-class FullAtnnResLayer(nn.Module):
-    def __init__(self, D): # init is always "build time" 
+class FullAtnnResLayer(nn.Module): # TODO: plumb in MHA block (DONT PLUMB IT INTO nn.sequential!) 
+    def __init__(self, D, num_heads=4): # init is always "build time" 
         super().__init__()
 
-        self.query = nn.Parameter(torch.zeros(D)) # this 1d vector lives inside a layer permanently. (just a weight vector)
+
+        self.mha_pre_norm = nn.RMSNorm(D) #this will be the norm we use before the mha block 
+
+        self.mha = MHA(D, num_heads)
+
+        self.mlp_pre_norm = nn.RMSNorm(D) # prenorm before mlp block ## RMSNorm is
+
+        self.mha_query = nn.Parameter(torch.zeros(D)) # this 1d vector lives inside a layer permanently. (just a weight vector, called w_l in the paper) FOR ATTNRES NOT REGULAR QUERY   
         ## fun fact ^^ nn.Parameter tells pytorch's memory allocator to allocate physical memory for this tensor PERMANENTLY, and let the autograd engine know that it exists
         ## ^^ if u look at definiton for nn.Linear vs torch.einsum, you'll see that torch.einsum has no nn.parameter! 
         self.norm = nn.RMSNorm(D)
 
-        self.transform = nn.Sequential(
+        self.transform = nn.Sequential( # defines one complete MLP block
             nn.Linear(D, D * 2), # does Y = X@W^T + B, we go from D, and upproject to D*2 (weight matrix must be D*2 x D before the transpose). do [B*T,D] @ [D, D*2]
             nn.GELU(),
             nn.Linear(D * 2, D) # down project back to D 
         )
+
+        ## TODO: plumb this into the forward method
+        self.mlp_query = nn.Parameter(torch.zeros(D))
     
-    def forward(self, previous_states):
+    def forward(self, previous_states): # previous states is just a list of tensors [h_0, h_1, h_2...] where each h_n is [B,T,D]
         V = torch.stack(previous_states) # [decoder layer (S), B, T, D] (4D tensor)
         # ^^ stack a bunch of h_n together (embedding, layer 1 output, layer 2 output, etc...)
         # also torch.stack is diff than torch.cat. cat glues tensors along an existing dim, stack creates a new dim and then glues. 
@@ -123,7 +136,7 @@ class FullAtnnResLayer(nn.Module):
         K = self.norm(V) # keys are same as values, but normalized 
 
         # literally our Q @ K^T 
-        logits = torch.einsum("d, s b t d -> s b t", self.query, K) # einsum is just a very flexible way to tensor contractions. here we sum along the hidden dimension D
+        logits = torch.einsum("d, s b t d -> s b t", self.mha_query, K) # einsum is just a very flexible way to tensor contractions. here we sum along the hidden dimension D
         # ^^ compare layer's "signature" to a history of previous layers (K)
 
         attn_weights = F.softmax(logits, dim=0)
@@ -133,8 +146,13 @@ class FullAtnnResLayer(nn.Module):
         h_l = torch.einsum("s b t, s b t d -> b t d", attn_weights, V) # here we sum along the sequence dim S
         # "give me a vector blend that is 20% of layer 1 and 80% of layer 2..."
         # by summing along the S dimension, we are creating weighted contributions across layers!
+        # h_l is the blended output of all the previous layers 
 
-        out = self.transform(h_l)
+        
+
+        out = self.transform(h_l) # MLP block called here. hm i should put MHA before this line? 
+
+
         return out 
 
 
