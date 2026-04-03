@@ -103,57 +103,52 @@ class MHA(nn.Module):
 
 # oh i should save my loss runs and gradients before i lose them? make a folder? 
 
-class FullAtnnResLayer(nn.Module): # TODO: plumb in MHA block (DONT PLUMB IT INTO nn.sequential!) 
-    def __init__(self, D, num_heads=4): # init is always "build time" 
+class FullAtnnResLayer(nn.Module):
+    def __init__(self, D, num_heads=4): # init is always "build time" INIT IS ALWAYS FOR STATEFUL MODULES
         super().__init__()
 
-
-        self.mha_pre_norm = nn.RMSNorm(D) #this will be the norm we use before the mha block 
+        # have seperate norms so MLP and MHA dont accidentally share the same RMSNorm weight
+        self.mha_history_norm = nn.RMSNorm(D)  
+        self.mlp_history_norm = nn.RMSNorm(D) 
 
         self.mha = MHA(D, num_heads)
-
-        self.mlp_pre_norm = nn.RMSNorm(D) # prenorm before mlp block ## RMSNorm is
-
         self.mha_query = nn.Parameter(torch.zeros(D)) # this 1d vector lives inside a layer permanently. (just a weight vector, called w_l in the paper) FOR ATTNRES NOT REGULAR QUERY   
-        ## fun fact ^^ nn.Parameter tells pytorch's memory allocator to allocate physical memory for this tensor PERMANENTLY, and let the autograd engine know that it exists
+        ## fun fact: ^^ nn.Parameter tells pytorch's memory allocator to allocate physical memory for this tensor PERMANENTLY, and let the autograd engine know that it exists
         ## ^^ if u look at definiton for nn.Linear vs torch.einsum, you'll see that torch.einsum has no nn.parameter! 
-        self.norm = nn.RMSNorm(D)
+
 
         self.transform = nn.Sequential( # defines one complete MLP block
             nn.Linear(D, D * 2), # does Y = X@W^T + B, we go from D, and upproject to D*2 (weight matrix must be D*2 x D before the transpose). do [B*T,D] @ [D, D*2]
             nn.GELU(),
             nn.Linear(D * 2, D) # down project back to D 
         )
-
-        ## TODO: plumb this into the forward method
         self.mlp_query = nn.Parameter(torch.zeros(D))
+
+
+    def alpha_gating(self, history, layer_type):
+        normed_history = self.mlp_history_norm(history) if layer_type == "mlp" else self.mha_history_norm(history)
+        pre_scores = torch.einsum("d, s b t d -> s b t", self.mlp_query if layer_type == "mlp" else self.mha_query, normed_history) # basically Q @ K^T 
+        scores = F.softmax(pre_scores, dim=0)
+        return torch.einsum("s b t, s b t d -> b t d", scores, history) # feeds into next layer (mlp or attn)
     
     def forward(self, previous_states): # previous states is just a list of tensors [h_0, h_1, h_2...] where each h_n is [B,T,D]
+        # we are continously appending to previous_states ... V and V_updated are just temporary tensors.... "nametags" if you will. 
         V = torch.stack(previous_states) # [decoder layer (S), B, T, D] (4D tensor)
-        # ^^ stack a bunch of h_n together (embedding, layer 1 output, layer 2 output, etc...)
         # also torch.stack is diff than torch.cat. cat glues tensors along an existing dim, stack creates a new dim and then glues. 
+        # torch.stack takes a bunch of scattered pointers and finds a giant empty space of memory - then physically copies the data from every single scattered tensor and pastes them contiguously!!
 
-        K = self.norm(V) # keys are same as values, but normalized 
+        gated_input_to_mha = self.alpha_gating(V, "mha")
+        mha_out = self.mha(gated_input_to_mha)
 
-        # literally our Q @ K^T 
-        logits = torch.einsum("d, s b t d -> s b t", self.mha_query, K) # einsum is just a very flexible way to tensor contractions. here we sum along the hidden dimension D
-        # ^^ compare layer's "signature" to a history of previous layers (K)
+        previous_states.append(mha_out)
 
-        attn_weights = F.softmax(logits, dim=0)
+        V_updated = torch.stack(previous_states)
+        gated_input_to_mlp = self.alpha_gating(V_updated, "mlp") # wait why not just inline the above line in here? uhhh does that save memory? 
+        mlp_out = self.transform(gated_input_to_mlp)
 
-        # END OF SCORING PHASE... mixing layer outputs phase next 
+        previous_states.append(mlp_out) # fun fact: .append is NOT CONTIGUOUS in memory. it just adds a pointer to the new tensor at the end of the list
 
-        h_l = torch.einsum("s b t, s b t d -> b t d", attn_weights, V) # here we sum along the sequence dim S
-        # "give me a vector blend that is 20% of layer 1 and 80% of layer 2..."
-        # by summing along the S dimension, we are creating weighted contributions across layers!
-        # h_l is the blended output of all the previous layers 
-
-        
-
-        out = self.transform(h_l) # MLP block called here. hm i should put MHA before this line? 
-
-
-        return out 
+        return previous_states 
 
 
 class AttentionRoutingModel(nn.Module): # our actual model 
@@ -175,12 +170,12 @@ class AttentionRoutingModel(nn.Module): # our actual model
 
         for layer in self.layers:
             if self.use_attn_res:
-                out = layer(states) ## attnres on ALSO self.forward calls __call__ method which automatrically triggers the forward method 
+                states = layer(states) ## attnres on ALSO self.forward calls __call__ method which automatrically triggers the forward method 
                 ## ^^ layer is a FullAtnnResLayer object. 
-            else:
+            else: # TODO: add back regular residuals now that attnres works
                 out = layer([states[-1]]) ## attnres off (vanilla residual)
         
-            states.append(out) # adds h_n to list... -> [h_0 = x, h_1, h_2...]
+            # states.append(out) # adds h_n to list... -> [h_0 = x, h_1, h_2...]
 
         return self.final_proj(states[-1]) # final matmul actually happens here! BECAUSE BY PUTTING PARENTHESIS AROUND final_proj, we...
         # ... are invoking the forward method within nn.Linear automatically! (right click on definition of nn.Linear to see what i mean)
