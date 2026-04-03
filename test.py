@@ -1,3 +1,6 @@
+import math
+import os
+
 import torch
 import torch.nn as nn # stateful 
 import torch.nn.functional as F # stateless
@@ -24,29 +27,44 @@ HIDDEN_SIZE = 16
 BATCH_SIZE = 32 # 32 samples wihin the 500, so 156 full batches and 1 tiny batch with 8 samples
 
 
-dataset = ReverseSequenceDataset(num_samples=NUM_SAMPLES, T=SEQ_LENGTH, D=HIDDEN_SIZE)
-dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True) # builds and streams batches of data from dataset
+def build_dataloader():
+    dataset = ReverseSequenceDataset(num_samples=NUM_SAMPLES, T=SEQ_LENGTH, D=HIDDEN_SIZE)
+    return DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True) # builds and streams batches of data from dataset
 
-# input_matrix = dataset.Y
-# print(input_matrix)
 
-# length_of_input = dataset.__len__() 
-# print(length_of_input)
+def parse_bool_env(name, default): ## helper func to parse boolean env variables for codex to access from shell. 
+    value = os.getenv(name)
+    if value is None:
+        return default
 
-x_batch, y_batch = next(iter(dataloader)) # forces dataloader to give us the first batch of data. then we decouple the tuple. 
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
 
-# fun fact: under the hood when you use a for loop, python is really just calling next() over and over again so thats...
-# ... why this works. 
+    raise ValueError(f"{name} must be one of true/false/1/0/yes/no/on/off")
 
-# print(f"Input batch shape: {x_batch.shape}") # 32x10x16
-# print(f"Target batch shape: {y_batch.shape}") # 32xx10x16
 
-# check if reversal worked
+def maybe_seed_from_env():
+    seed = os.getenv("SEED")
+    if seed is None:
+        return None
 
-# print("First sequence of tokens in input tensor: ")
-# print(x_batch[0, :, 0]) # B = 0, T = all, D = 0 
-# print("First sequence of tokens in target tensor: ")
-# print(y_batch[0, :, 0])
+    torch.manual_seed(int(seed))
+    return int(seed)
+
+
+def sinusoidal_positional_encoding(seq_len, hidden_size, device, dtype):
+    positions = torch.arange(seq_len, device=device, dtype=dtype).unsqueeze(1)
+    div_term = torch.exp(
+        torch.arange(0, hidden_size, 2, device=device, dtype=dtype) * (-math.log(10000.0) / hidden_size)
+    )
+
+    pe = torch.zeros(seq_len, hidden_size, device=device, dtype=dtype)
+    pe[:, 0::2] = torch.sin(positions * div_term)
+    pe[:, 1::2] = torch.cos(positions * div_term[: pe[:, 1::2].shape[1]])
+    return pe.unsqueeze(0)
 
 
 class SelfAttention(nn.Module): # for a single head of attention. 
@@ -83,6 +101,9 @@ class MHA(nn.Module):
     def __init__(self, D, num_heads=4):
         super().__init__()
 
+        if D % num_heads != 0:
+            raise ValueError(f"hidden size {D} must be divisible by num_heads {num_heads}")
+
         self.num_heads = num_heads
         self.head_dim = D // num_heads
         self.D = D
@@ -107,9 +128,13 @@ class FullAtnnResLayer(nn.Module):
     def __init__(self, D, num_heads=4): # init is always "build time" INIT IS ALWAYS FOR STATEFUL MODULES
         super().__init__()
 
-        # have seperate norms so MLP and MHA dont accidentally share the same RMSNorm weight
-        self.mha_history_norm = nn.RMSNorm(D)  
-        self.mlp_history_norm = nn.RMSNorm(D) 
+        # Paper-faithful AttnRes uses separate norms for:
+        # 1) scoring the depth history, and
+        # 2) the actual PreNorm input to each sublayer.
+        self.mha_res_norm = nn.RMSNorm(D)
+        self.mha_input_norm = nn.RMSNorm(D)
+        self.mlp_res_norm = nn.RMSNorm(D)
+        self.mlp_input_norm = nn.RMSNorm(D)
 
         self.mha = MHA(D, num_heads)
         self.mha_query = nn.Parameter(torch.zeros(D)) # this 1d vector lives inside a layer permanently. (just a weight vector, called w_l in the paper) FOR ATTNRES NOT REGULAR QUERY   
@@ -126,29 +151,34 @@ class FullAtnnResLayer(nn.Module):
 
 
     def alpha_gating(self, history, layer_type):
-        normed_history = self.mlp_history_norm(history) if layer_type == "mlp" else self.mha_history_norm(history)
+        normed_history = self.mlp_res_norm(history) if layer_type == "mlp" else self.mha_res_norm(history)
         pre_scores = torch.einsum("d, s b t d -> s b t", self.mlp_query if layer_type == "mlp" else self.mha_query, normed_history) # basically Q @ K^T 
         scores = F.softmax(pre_scores, dim=0)
         return torch.einsum("s b t, s b t d -> b t d", scores, history) # feeds into next layer (mlp or attn)
     
-    def forward(self, previous_states): # previous states is just a list of tensors [h_0, h_1, h_2...] where each h_n is [B,T,D]
+    def forward_attn_res(self, previous_states): # previous states is just a list of tensors [h_0, h_1, h_2...] where each h_n is [B,T,D]
         # we are continously appending to previous_states ... V and V_updated are just temporary tensors.... "nametags" if you will. 
         V = torch.stack(previous_states) # [decoder layer (S), B, T, D] (4D tensor)
         # also torch.stack is diff than torch.cat. cat glues tensors along an existing dim, stack creates a new dim and then glues. 
         # torch.stack takes a bunch of scattered pointers and finds a giant empty space of memory - then physically copies the data from every single scattered tensor and pastes them contiguously!!
 
         gated_input_to_mha = self.alpha_gating(V, "mha")
-        mha_out = self.mha(gated_input_to_mha)
+        mha_out = self.mha(self.mha_input_norm(gated_input_to_mha))
 
         previous_states.append(mha_out)
 
         V_updated = torch.stack(previous_states)
         gated_input_to_mlp = self.alpha_gating(V_updated, "mlp") # wait why not just inline the above line in here? uhhh does that save memory? 
-        mlp_out = self.transform(gated_input_to_mlp)
+        mlp_out = self.transform(self.mlp_input_norm(gated_input_to_mlp))
 
         previous_states.append(mlp_out) # fun fact: .append is NOT CONTIGUOUS in memory. it just adds a pointer to the new tensor at the end of the list
 
         return previous_states 
+
+    def forward_standard_residual(self, x):
+        x = x + self.mha(self.mha_input_norm(x))
+        x = x + self.transform(self.mlp_input_norm(x))
+        return x
 
 
 class AttentionRoutingModel(nn.Module): # our actual model 
@@ -164,16 +194,16 @@ class AttentionRoutingModel(nn.Module): # our actual model
         # ^^ well technically it just instantiates the weight matrix. the actual matmul happens in self.final_proj's forward method, inherited from nn.Linear. 
 
     def forward(self, x):
+        x = x + sinusoidal_positional_encoding(x.size(1), x.size(2), x.device, x.dtype)
         states = [x] # accumulated embedding + h_n tensors. at first tho we just start with the input embedding, h_0 = x.
-
-        # TODO: add rope or sinusoidal positional encodings? should prolly push what i have first then add pos encodinghs later
 
         for layer in self.layers:
             if self.use_attn_res:
-                states = layer(states) ## attnres on ALSO self.forward calls __call__ method which automatrically triggers the forward method 
+                states = layer.forward_attn_res(states) ## attnres on ALSO self.forward calls __call__ method which automatrically triggers the forward method 
                 ## ^^ layer is a FullAtnnResLayer object. 
-            else: # TODO: add back regular residuals now that attnres works
-                out = layer([states[-1]]) ## attnres off (vanilla residual)
+            else:
+                out = layer.forward_standard_residual(states[-1])
+                states.append(out)
         
             # states.append(out) # adds h_n to list... -> [h_0 = x, h_1, h_2...]
 
@@ -182,12 +212,9 @@ class AttentionRoutingModel(nn.Module): # our actual model
 
 
 
-### building the training loop 
-
-if __name__ == "__main__":
-    USE_ATTN_RES = True ## toggle this to false to see standard res, and true for attnres
-
-    model = AttentionRoutingModel(D=HIDDEN_SIZE, num_layers=4, use_attn_res=USE_ATTN_RES)
+def run_experiment(use_attn_res):
+    dataloader = build_dataloader()
+    model = AttentionRoutingModel(D=HIDDEN_SIZE, num_layers=4, use_attn_res=use_attn_res)
     optimizer = optim.Adam(model.parameters(), lr=0.005)
     criterion = nn.MSELoss()
 
@@ -197,6 +224,9 @@ if __name__ == "__main__":
         layer1_grads.append(grad.abs().mean().item()) # snapshot of a weight gradient i.e. if a weight matrix is (D x D*2), like in our first linear layer, then the gradient is 16x32 = 512 values. 
     
     model.layers[0].transform[0].weight.register_hook(capture_gradients) # this is a hook that triggers capture_gradients every time a gradient flows through the weight matrix of the first linear layer. 
+
+    print(f"USE_ATTN_RES={use_attn_res}")
+    print("POSITIONAL_EMBEDDINGS=sinusoidal")
 
 ## begin training loop
 
@@ -218,5 +248,15 @@ if __name__ == "__main__":
         # calcualte avg gradient magnitude for layer 1
         avg_grad = sum(layer1_grads[-len(dataloader):]) / len(dataloader) # grab the last 157 entries within layer1_grads, sum them up and divide by 157! 
         print(f"Epoch {epoch+1}/{epochs} | Loss: {epoch_loss/len(dataloader):.4f} | Avg Layer-1 Gradient: {avg_grad:.6f}")
+
+
+### building the training loop 
+
+if __name__ == "__main__":
+    seed = maybe_seed_from_env()
+    if seed is not None:
+        print(f"SEED={seed}")
+
+    run_experiment(parse_bool_env("USE_ATTN_RES", True))
 
 # TODO: implement block attnres 
